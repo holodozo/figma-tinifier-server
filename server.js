@@ -2,15 +2,23 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const tinify = require('tinify');
+const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Multer for binary uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+});
 
 // Middleware
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type'],
+  exposedHeaders: ['X-Original-Size', 'X-Compressed-Size', 'X-Savings', 'X-Compression-Count']
 }));
 app.use(express.json({ limit: '50mb' }));
 
@@ -49,7 +57,7 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
-// POST /api/compress - Compress an image
+// POST /api/compress - Compress an image (base64 - legacy)
 app.post('/api/compress', async (req, res) => {
   try {
     const { image, format, width, height, background } = req.body;
@@ -64,66 +72,106 @@ app.post('/api/compress', async (req, res) => {
     // Decode base64 image
     const imageBuffer = Buffer.from(image, 'base64');
 
-    // Start with source
-    let source = tinify.fromBuffer(imageBuffer);
-    let result = source;
-
-    // Apply resize if dimensions provided
-    if (width || height) {
-      result = result.resize({
-        method: 'fit',
-        width: width ? parseInt(width) : 9999,
-        height: height ? parseInt(height) : 9999
-      });
-    }
-
-    // Apply format conversion if not PNG
-    const outputFormat = format || 'png';
-    if (outputFormat !== 'png') {
-      result = result.convert({ type: `image/${outputFormat === 'jpg' ? 'jpeg' : outputFormat}` });
-    }
-
-    // Add background for formats that don't support transparency
-    if (outputFormat === 'jpeg' || outputFormat === 'jpg') {
-      result = result.transform({ background: background || 'white' });
-    }
-
-    // Get compressed buffer
-    const compressedBuffer = await result.toBuffer();
+    const result = await compressImage(imageBuffer, { format, width, height, background });
 
     // Return base64-encoded result
     res.json({
       success: true,
-      data: compressedBuffer.toString('base64'),
+      data: result.buffer.toString('base64'),
       originalSize: imageBuffer.length,
-      compressedSize: compressedBuffer.length,
-      savings: Math.round((1 - compressedBuffer.length / imageBuffer.length) * 100),
+      compressedSize: result.buffer.length,
+      savings: Math.round((1 - result.buffer.length / imageBuffer.length) * 100),
       compressionCount: tinify.compressionCount
     });
 
   } catch (error) {
-    console.error('Compression error:', error);
-
-    // Handle specific Tinify errors
-    if (error.status === 401) {
-      return res.status(401).json({
-        error: 'Invalid API key',
-        message: 'Check your TINIFY_API_KEY in .env file'
-      });
-    }
-    if (error.status === 429) {
-      return res.status(429).json({
-        error: 'Rate limited',
-        message: 'Monthly compression limit reached (500 for free tier)'
-      });
-    }
-
-    res.status(500).json({
-      error: 'Compression failed',
-      message: error.message
-    });
+    handleCompressionError(error, res);
   }
 });
+
+// POST /api/compress/binary - Compress an image (binary - faster)
+app.post('/api/compress/binary', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: 'Missing image data',
+        message: 'Please provide image file'
+      });
+    }
+
+    const { format, width, height, background } = req.body;
+    const imageBuffer = req.file.buffer;
+
+    const result = await compressImage(imageBuffer, { format, width, height, background });
+
+    // Return binary response
+    res.set({
+      'Content-Type': `image/${result.format}`,
+      'X-Original-Size': imageBuffer.length.toString(),
+      'X-Compressed-Size': result.buffer.length.toString(),
+      'X-Savings': Math.round((1 - result.buffer.length / imageBuffer.length) * 100).toString(),
+      'X-Compression-Count': (tinify.compressionCount || 0).toString()
+    });
+    res.send(result.buffer);
+
+  } catch (error) {
+    handleCompressionError(error, res);
+  }
+});
+
+// Shared compression logic
+async function compressImage(imageBuffer, options) {
+  const { format, width, height, background } = options;
+
+  let source = tinify.fromBuffer(imageBuffer);
+  let result = source;
+
+  // Apply resize if dimensions provided
+  if (width || height) {
+    result = result.resize({
+      method: 'fit',
+      width: width ? parseInt(width) : 9999,
+      height: height ? parseInt(height) : 9999
+    });
+  }
+
+  // Apply format conversion if not PNG
+  const outputFormat = format || 'png';
+  if (outputFormat !== 'png') {
+    result = result.convert({ type: `image/${outputFormat === 'jpg' ? 'jpeg' : outputFormat}` });
+  }
+
+  // Add background for formats that don't support transparency
+  if (outputFormat === 'jpeg' || outputFormat === 'jpg') {
+    result = result.transform({ background: background || 'white' });
+  }
+
+  const compressedBuffer = await result.toBuffer();
+  return { buffer: compressedBuffer, format: outputFormat };
+}
+
+// Shared error handling
+function handleCompressionError(error, res) {
+  console.error('Compression error:', error);
+
+  if (error.status === 401) {
+    return res.status(401).json({
+      error: 'Invalid API key',
+      message: 'Check your TINIFY_API_KEY in .env file'
+    });
+  }
+  if (error.status === 429) {
+    return res.status(429).json({
+      error: 'Rate limited',
+      message: 'Monthly compression limit reached (500 for free tier)'
+    });
+  }
+
+  res.status(500).json({
+    error: 'Compression failed',
+    message: error.message
+  });
+}
 
 // Start server (listen on 0.0.0.0 for Railway/Docker)
 app.listen(PORT, '0.0.0.0', () => {
